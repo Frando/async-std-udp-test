@@ -2,6 +2,7 @@ use async_std::net::UdpSocket;
 use async_std::stream::{Stream, StreamExt};
 use async_std::task;
 use futures::future::Future;
+use futures::ready;
 use std::io::Result;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -26,7 +27,7 @@ async fn udp_test() -> Result<()> {
 async fn read_loop(bind_addr: &str) -> Result<()> {
     let socket = UdpSocket::bind(bind_addr).await?;
     let local_addr = socket.local_addr().unwrap();
-    let mut stream = UdpStream::new(socket);
+    let mut stream = UdpStream::new(&socket);
     while let Some(message) = stream.next().await {
         let message = message?;
         eprintln!(
@@ -53,56 +54,53 @@ async fn send_loop(bind_addr: &str, peer_addr: &str) -> Result<()> {
     }
 }
 
-type ReceiveResult = Result<(usize, SocketAddr)>;
-
-struct UdpStream {
-    inner: Option<(UdpSocket, Vec<u8>)>,
-    fut: Option<Pin<Box<dyn Future<Output = (UdpSocket, Vec<u8>, ReceiveResult)> + Send + Sync>>>,
+pub struct UdpStream<'a> {
+    socket: &'a UdpSocket,
+    fut: Option<Pin<Box<dyn Future<Output = Result<(Vec<u8>, SocketAddr)>> + Send + Sync + 'a>>>,
+    // buf: Option<Vec<u8>>,
 }
 
-impl UdpStream {
-    pub fn new(socket: UdpSocket) -> Self {
-        let buf = vec![0u8; 1024];
+impl<'a> UdpStream<'a> {
+    pub fn new(socket: &'a UdpSocket) -> Self {
+        // let buf = vec![0u8; 1024];
         Self {
+            socket,
             fut: None,
-            inner: Some((socket, buf)),
+            // buf: Some(buf),
         }
     }
+
+    pub fn get_ref(&self) -> &'a UdpSocket {
+        self.socket
+    }
 }
-impl Stream for UdpStream {
+
+async fn recv_next(socket: &UdpSocket) -> Result<(Vec<u8>, SocketAddr)> {
+    let mut buf = vec![0u8; 1024];
+    let res = socket.recv_from(&mut buf).await;
+    match res {
+        Err(e) => Err(e),
+        Ok((n, addr)) => Ok((buf[..n].to_vec(), addr)),
+    }
+}
+
+impl<'a> Stream for UdpStream<'a> {
     type Item = Result<(Vec<u8>, SocketAddr)>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut fut = if let Some(fut) = self.fut.take() {
-            fut
-        } else {
-            if let Some((socket, buf)) = self.inner.take() {
-                let fut = recv_next(socket, buf);
-                Box::pin(fut)
-            } else {
-                unreachable!()
+        loop {
+            if self.fut.is_none() {
+                let fut = recv_next(self.socket);
+                self.fut = Some(Box::pin(fut));
             }
-        };
 
-        let res = Pin::new(&mut fut).poll(cx);
-
-        match res {
-            Poll::Pending => {
-                self.fut = Some(fut);
-                Poll::Pending
+            if let Some(f) = &mut self.fut {
+                let res = ready!(f.as_mut().poll(cx));
+                self.fut = None;
+                return match res {
+                    Err(e) => Poll::Ready(Some(Err(e))),
+                    Ok((buf, addr)) => Poll::Ready(Some(Ok((buf, addr)))),
+                };
             }
-            Poll::Ready((socket, buf, res)) => match res {
-                Ok((n, peer_addr)) => {
-                    let vec = buf[..n].to_vec();
-                    self.inner = Some((socket, buf));
-                    Poll::Ready(Some(Ok((vec, peer_addr))))
-                }
-                Err(e) => Poll::Ready(Some(Err(e))),
-            },
         }
     }
-}
-
-async fn recv_next(socket: UdpSocket, mut buf: Vec<u8>) -> (UdpSocket, Vec<u8>, ReceiveResult) {
-    let res = socket.recv_from(&mut buf).await;
-    (socket, buf, res)
 }
